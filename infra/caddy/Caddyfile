@@ -1,0 +1,92 @@
+# =============================================================================
+# infra/caddy/Caddyfile
+# =============================================================================
+# - Automatic HTTPS via Let's Encrypt when DOMAIN is set to a real domain.
+# - Falls back to self-signed for `localhost` / IP-only deployments.
+# - Routes:
+#     /api/*       → NestJS API
+#     /tiles/*     → pg_tileserv (vector tiles)
+#     /storage/*   → MinIO (presigned URL traffic)
+#     /health      → Caddy itself (for external checks)
+#     /            → web frontend (placeholder; serve from CDN or another container)
+# =============================================================================
+
+{
+    email {$ACME_EMAIL}
+    # Uncomment the line below for staging certs while testing:
+    # acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+
+    # Sensible global defaults
+    servers {
+        max_header_size 64KB
+    }
+}
+
+{$DOMAIN:localhost} {
+    encode zstd gzip
+
+    # Security headers — adjust CSP if you serve a SPA from this same origin
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options    "nosniff"
+        X-Frame-Options           "DENY"
+        Referrer-Policy           "strict-origin-when-cross-origin"
+        Permissions-Policy        "geolocation=(self)"
+        # remove the default X-Powered-By
+        -Server
+    }
+
+    # ---- API ----
+    handle_path /api/* {
+        reverse_proxy api:3000 {
+            # 30 s for sync push payloads, otherwise default
+            transport http {
+                response_header_timeout 30s
+            }
+        }
+    }
+
+    # ---- Vector tiles ----
+    handle_path /tiles/* {
+        # tileserv responds with Cache-Control already; we add a CDN-level hint
+        header Cache-Control "public, max-age=60"
+        reverse_proxy tileserver:7800
+    }
+
+    # ---- MinIO (object storage, presigned URL traffic) ----
+    # The mobile client PUTs photos directly to /storage/<bucket>/<key>?...
+    handle_path /storage/* {
+        reverse_proxy minio:9000 {
+            # MinIO uses the Host header in its signature verification
+            header_up Host {upstream_hostport}
+        }
+    }
+
+    # ---- MinIO console (admin only — restrict by IP or remove in prod) ----
+    handle_path /minio/* {
+        # @admins remote_ip 1.2.3.4/32
+        # respond @admins 403
+        reverse_proxy minio:9001 {
+            header_up Host {upstream_hostport}
+        }
+    }
+
+    # ---- Health ----
+    handle /health {
+        respond "ok" 200
+    }
+
+    # ---- Default: web frontend ----
+    handle {
+        # Replace with a `file_server` block pointing at your built React app,
+        # or `reverse_proxy web:80` if you containerise the frontend.
+        respond "Farm ERP — API only on this host. Mount the web app here." 200
+    }
+
+    # Access logs to stdout (Docker captures them)
+    log {
+        output stdout
+        format console
+        level INFO
+    }
+}

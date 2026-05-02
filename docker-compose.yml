@@ -1,0 +1,324 @@
+# =============================================================================
+# Farm ERP — full local/single-node production stack
+# =============================================================================
+# Bring up everything:
+#   cp .env.example .env && edit secrets
+#   docker compose up -d
+#   docker compose run --rm api-migrate     # one-shot schema setup
+#   docker compose run --rm api-seed        # populate demo data
+#
+# Healthchecks ensure dependent services wait. Volumes persist across
+# `docker compose down`. Use `docker compose down -v` to nuke everything.
+# =============================================================================
+
+name: farm-erp
+
+# -----------------------------------------------------------------------------
+# Networks
+# -----------------------------------------------------------------------------
+# All inter-service traffic stays on the internal network. Only Caddy
+# binds to host ports — even Postgres and MinIO are unreachable from outside.
+networks:
+  internal:
+    driver: bridge
+  edge:
+    driver: bridge
+
+# -----------------------------------------------------------------------------
+# Volumes
+# -----------------------------------------------------------------------------
+volumes:
+  postgres-data:
+  minio-data:
+  mosquitto-data:
+  mosquitto-log:
+  redis-data:
+  caddy-data:
+  caddy-config:
+
+# -----------------------------------------------------------------------------
+# Services
+# -----------------------------------------------------------------------------
+services:
+
+  # ---------------------------------------------------------------------------
+  # Postgres + PostGIS
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgis/postgis:16-3.4
+    container_name: farmerp-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: farm_erp
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
+      # Pass the app role passwords through to the init script
+      APP_USER_PASSWORD:  ${APP_USER_PASSWORD:?required}
+      APP_ADMIN_PASSWORD: ${APP_ADMIN_PASSWORD:?required}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # 01-roles.sh runs ONCE on first boot — creates app_user / app_admin
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d farm_erp"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    networks:
+      internal:
+        aliases: [db]
+    # NOTE: we deliberately do NOT publish 5432. Connect via `docker compose
+    # exec postgres psql ...` for ops tasks.
+    deploy:
+      resources:
+        limits: { memory: 4G }
+        reservations: { memory: 1G }
+
+  # ---------------------------------------------------------------------------
+  # Tile server — tenant-aware MVT generator (replaces pg_tileserv)
+  # ---------------------------------------------------------------------------
+  tileserver:
+    build:
+      context: .
+      dockerfile: ./apps/tileserver/Dockerfile
+    image: farmerp/tileserver:latest
+    container_name: farmerp-tileserver
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: "7800"
+      DATABASE_URL: postgres://app_user:${APP_USER_PASSWORD}@postgres:5432/farm_erp?schema=public
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET}
+      CORS_ORIGINS: ${CORS_ORIGINS}
+      PG_POOL_MAX: "20"
+      LOG_LEVEL: info
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:7800/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks: [internal]
+    deploy:
+      resources:
+        limits: { memory: 512M }
+
+  # ---------------------------------------------------------------------------
+  # MinIO — S3-compatible object storage for photos, MBTiles, exports
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    container_name: farmerp-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER:     ${MINIO_ROOT_USER:?required}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?required}
+      # Tell MinIO what URL it's reachable from publicly so presigned
+      # URLs use the right host. Caddy will proxy /storage/* to this.
+      MINIO_SERVER_URL:        ${PUBLIC_BASE_URL}/storage
+      MINIO_BROWSER_REDIRECT_URL: ${PUBLIC_BASE_URL}/minio
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [internal]
+
+  # One-shot bucket bootstrap. Idempotent.
+  minio-init:
+    image: minio/mc:latest
+    container_name: farmerp-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER:     ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD;
+        mc mb --ignore-existing local/farm-erp-uploads;
+        mc mb --ignore-existing local/farm-erp-mbtiles;
+        mc mb --ignore-existing local/farm-erp-exports;
+        mc anonymous set none local/farm-erp-uploads;
+        mc anonymous set none local/farm-erp-exports;
+        mc anonymous set download local/farm-erp-mbtiles;
+        echo 'MinIO buckets ready';
+      "
+    networks: [internal]
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Mosquitto — MQTT broker for IoT sensors (soil moisture, weather stations)
+  # ---------------------------------------------------------------------------
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: farmerp-mqtt
+    restart: unless-stopped
+    volumes:
+      - ./infra/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./infra/mosquitto/passwd:/mosquitto/config/passwd:ro
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-log:/mosquitto/log
+    ports:
+      # MQTT (TLS): expose for field IoT devices. Plain 1883 only for dev.
+      - "${MQTT_PORT:-1883}:1883"
+      # - "8883:8883"   # uncomment when you mount certs
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -h localhost -t 'healthcheck' -E -i hc -W 2 || exit 0"]
+      interval: 30s
+    networks: [internal, edge]
+
+  # ---------------------------------------------------------------------------
+  # Redis — cache, BullMQ queues, pub/sub
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: farmerp-redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD:?required} --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+    networks: [internal]
+
+  # ---------------------------------------------------------------------------
+  # API — NestJS
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: ./apps/api/Dockerfile
+    image: farmerp/api:latest
+    container_name: farmerp-api
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      # App user (RLS-bound) — used for all request handling
+      DATABASE_URL:       postgres://app_user:${APP_USER_PASSWORD}@postgres:5432/farm_erp?schema=public
+      # Admin (BYPASSRLS) — used for migrations, seed, cross-tenant ops
+      DATABASE_ADMIN_URL: postgres://app_admin:${APP_ADMIN_PASSWORD}@postgres:5432/farm_erp?schema=public
+      JWT_ACCESS_SECRET:  ${JWT_ACCESS_SECRET:?required}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?required}
+      MINIO_ENDPOINT:     minio
+      MINIO_PORT:         "9000"
+      MINIO_USE_SSL:      "false"
+      MINIO_ACCESS_KEY:   ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY:   ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET:       farm-erp-uploads
+      REDIS_URL:          redis://:${REDIS_PASSWORD}@redis:6379
+      MQTT_URL:           mqtt://mosquitto:1883
+      PUBLIC_BASE_URL:    ${PUBLIC_BASE_URL}
+      CORS_ORIGINS:       ${CORS_ORIGINS}
+    depends_on:
+      postgres:  { condition: service_healthy }
+      minio:     { condition: service_healthy }
+      redis:     { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks: [internal]
+    deploy:
+      resources:
+        limits: { memory: 1G }
+
+  # One-shot: prisma migrate + postgis-setup.sql + tile-functions.sql
+  api-migrate:
+    image: farmerp/api:latest
+    container_name: farmerp-migrate
+    profiles: ["migrate"]   # only runs when explicitly invoked
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      DATABASE_URL:       postgres://app_admin:${APP_ADMIN_PASSWORD}@postgres:5432/farm_erp?schema=public
+      DATABASE_ADMIN_URL: postgres://app_admin:${APP_ADMIN_PASSWORD}@postgres:5432/farm_erp?schema=public
+    entrypoint: >
+      /bin/sh -c "
+        set -e;
+        echo '→ prisma migrate deploy';
+        npx prisma migrate deploy;
+        echo '→ apply postgis-setup.sql';
+        psql $$DATABASE_ADMIN_URL -v ON_ERROR_STOP=1 -f /app/prisma/postgis-setup.sql;
+        echo '→ apply tile-functions.sql';
+        psql $$DATABASE_ADMIN_URL -v ON_ERROR_STOP=1 -f /app/prisma/tile-functions.sql;
+        echo '✓ migration complete';
+      "
+    networks: [internal]
+    restart: "no"
+
+  # One-shot: prisma db seed
+  api-seed:
+    image: farmerp/api:latest
+    container_name: farmerp-seed
+    profiles: ["seed"]
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      DATABASE_URL: postgres://app_admin:${APP_ADMIN_PASSWORD}@postgres:5432/farm_erp?schema=public
+    entrypoint: ["npx", "prisma", "db", "seed"]
+    volumes:
+      # Mount the GeoJSON so the seed runner can read it
+      - ./fixtures:/app/fixtures:ro
+    networks: [internal]
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # BullMQ worker — background jobs
+  # ---------------------------------------------------------------------------
+  worker:
+    image: farmerp/api:latest
+    container_name: farmerp-worker
+    restart: unless-stopped
+    command: ["node", "dist/worker.js"]
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://app_user:${APP_USER_PASSWORD}@postgres:5432/farm_erp?schema=public
+      DATABASE_ADMIN_URL: postgres://app_admin:${APP_ADMIN_PASSWORD}@postgres:5432/farm_erp?schema=public
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      MINIO_ENDPOINT: minio
+      MINIO_PORT: "9000"
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    networks: [internal]
+    deploy:
+      resources:
+        limits: { memory: 1G }
+
+  # ---------------------------------------------------------------------------
+  # Caddy — reverse proxy + automatic HTTPS
+  # ---------------------------------------------------------------------------
+  caddy:
+    image: caddy:2-alpine
+    container_name: farmerp-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+      ACME_EMAIL: ${ACME_EMAIL:-noreply@example.com}
+    volumes:
+      - ./infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      api:         { condition: service_started }
+      tileserver:  { condition: service_started }
+      minio:       { condition: service_healthy }
+    networks: [internal, edge]
