@@ -1,0 +1,43 @@
+{
+  "name": "wonde-farm-erp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "GIS-native, offline-first ERP for farm operations",
+  "license": "UNLICENSED",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "lint": "eslint . --ext .ts,.tsx",
+    "lint:fix": "eslint . --ext .ts,.tsx --fix",
+    "format": "prettier --write \"**/*.{ts,tsx,md,yml,yaml,json}\"",
+    "format:check": "prettier --check \"**/*.{ts,tsx,md,yml,yaml,json}\"",
+    "typecheck": "tsc --build --pretty",
+    "test": "npm run test --workspaces --if-present",
+    "e2e": "playwright test --config=e2e/playwright.config.ts",
+    "seed": "tsx prisma/seed.ts",
+    "prisma:migrate": "prisma migrate deploy",
+    "prisma:generate": "prisma generate",
+    "compose:up": "docker compose up -d",
+    "compose:migrate": "docker compose --profile migrate run --rm api-migrate",
+    "compose:seed": "docker compose --profile seed run --rm api-seed"
+  },
+  "prisma": {
+    "schema": "prisma/schema.prisma",
+    "seed": "tsx prisma/seed.ts"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.45.0",
+    "@types/node": "^22.0.0",
+    "eslint": "^8.57.0",
+    "prettier": "^3.2.0",
+    "prisma": "^5.20.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.4.0"
+  }
+}

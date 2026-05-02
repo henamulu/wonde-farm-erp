@@ -1,0 +1,52 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build artifacts
+dist/
+build/
+*.tsbuildinfo
+
+# Env / secrets — NEVER commit
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Generated
+prisma/migrations/dev.db*
+*.generated.ts
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.swp
+
+# Test artifacts
+coverage/
+.nyc_output/
+e2e/.artifacts/
+playwright-report/
+test-results/
+
+# Docker volumes (when run locally without -v flag)
+postgres-data/
+minio-data/
+
+# Mobile
+apps/mobile/.expo/
+apps/mobile/ios/build/
+apps/mobile/android/build/
+apps/mobile/android/.gradle/
+
+# OS / misc
+.cache/
+tmp/
