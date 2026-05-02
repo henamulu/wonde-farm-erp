@@ -1,0 +1,175 @@
+# =============================================================================
+# .github/workflows/deploy.yml
+# =============================================================================
+# On push to main: build api, tileserver, worker images → push to GHCR
+# (ghcr.io/<owner>/<repo>/<service>:<sha>+latest) → SSH to the Hetzner box,
+# pull the new images, run migrations, restart services.
+#
+# Required GitHub Secrets:
+#   HETZNER_HOST       — IP or DNS of the production box
+#   HETZNER_USER       — SSH user (typically `deploy`, NOT root)
+#   HETZNER_SSH_KEY    — private key with access to that user
+#   HETZNER_SSH_PORT   — (optional) defaults to 22
+#
+# Required Hetzner-side preparation, run ONCE on the box:
+#   1.  useradd -m -s /bin/bash deploy && usermod -aG docker deploy
+#   2.  su - deploy
+#   3.  mkdir -p /opt/farmerp && cd /opt/farmerp
+#   4.  Clone the repo + copy .env.example → .env (fill secrets)
+#   5.  echo $GHCR_TOKEN | docker login ghcr.io -u <github-user> --password-stdin
+#       (token = a GitHub PAT with read:packages scope — stored on the box,
+#        not in this workflow, so the box can pull private images)
+#   6.  docker compose --profile migrate run --rm api-migrate
+#   7.  docker compose up -d
+# =============================================================================
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:        # manual re-deploy from the Actions tab
+
+concurrency:
+  group: deploy-production  # only one deploy at a time
+  cancel-in-progress: false # let an in-flight deploy finish; queue the next
+
+permissions:
+  contents: read
+  packages: write           # push to GHCR
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/${{ github.repository }}
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Build & push images for each service
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build ${{ matrix.service }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: api
+            dockerfile: ./apps/api/Dockerfile
+            context: .
+          - service: tileserver
+            dockerfile: ./apps/tileserver/Dockerfile
+            context: .
+          - service: worker
+            dockerfile: ./apps/worker/Dockerfile
+            context: .
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tag
+        id: meta
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "tag=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "image=${{ env.IMAGE_PREFIX }}/${{ matrix.service }}" >> $GITHUB_OUTPUT
+
+      - name: Build & push
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64       # Hetzner CCX is amd64; skip arm64 to halve build time
+          push: true
+          # `latest` tracks main; `<sha>` is what compose actually pulls so
+          # we get atomic-ish rollouts and easy rollback by SHA.
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:latest
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to:   type=gha,scope=${{ matrix.service }},mode=max
+          provenance: false             # smaller image, no SLSA needed for now
+
+  # ---------------------------------------------------------------------------
+  # Deploy: SSH to Hetzner, pull, migrate, roll services
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to Hetzner
+    runs-on: ubuntu-24.04
+    needs: build
+    timeout-minutes: 15
+
+    steps:
+      - name: Compute image tag
+        id: meta
+        run: echo "tag=$(echo "${{ github.sha }}" | cut -c1-7)" >> $GITHUB_OUTPUT
+
+      - name: SSH deploy
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.HETZNER_HOST }}
+          username: ${{ secrets.HETZNER_USER }}
+          key: ${{ secrets.HETZNER_SSH_KEY }}
+          port: ${{ secrets.HETZNER_SSH_PORT || 22 }}
+          envs: TAG
+          script_stop: true              # halt on first non-zero exit
+          script: |
+            set -euo pipefail
+            cd /opt/farmerp
+
+            export TAG="${{ steps.meta.outputs.tag }}"
+
+            echo "→ pulling ${TAG}"
+            # docker-compose.yml on the box should reference these images
+            # via env, e.g.  image: ${API_IMAGE}:${TAG:-latest}
+            export API_IMAGE=ghcr.io/${{ github.repository }}/api
+            export TILESERVER_IMAGE=ghcr.io/${{ github.repository }}/tileserver
+            export WORKER_IMAGE=ghcr.io/${{ github.repository }}/worker
+            docker compose pull api tileserver worker
+
+            echo "→ running migrations"
+            docker compose --profile migrate run --rm api-migrate
+
+            echo "→ rolling api + tileserver + worker"
+            docker compose up -d api tileserver worker
+            # Caddy isn't restarted unless its config changed — `docker compose
+            # up -d` with no diff is a no-op.
+
+            echo "→ pruning old images (keep last 3 per service)"
+            docker image prune -f
+            for svc in api tileserver worker; do
+              docker images "ghcr.io/${{ github.repository }}/${svc}" \
+                --format '{{.ID}} {{.CreatedAt}}' | sort -rk2 | tail -n +4 | \
+                awk '{print $1}' | xargs -r docker rmi -f || true
+            done
+
+            echo "→ verifying health"
+            for i in 1 2 3 4 5 6; do
+              if curl -fsS http://localhost:3000/health > /dev/null; then
+                echo "✓ api healthy"; break
+              fi
+              echo "waiting for api... ($i/6)"; sleep 5
+              if [ $i -eq 6 ]; then echo "✗ api failed health check"; exit 1; fi
+            done
+
+      - name: Notify rollback hint on failure
+        if: failure()
+        run: |
+          echo "::warning::Deploy failed. To roll back, SSH to the box and run:"
+          echo "  cd /opt/farmerp && export TAG=<previous-sha> && docker compose up -d"

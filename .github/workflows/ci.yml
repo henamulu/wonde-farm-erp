@@ -1,0 +1,188 @@
+# =============================================================================
+# .github/workflows/ci.yml
+# =============================================================================
+# Runs on every PR and every push to main. Catches typecheck/lint regressions
+# and runs the migration + test suite against a real Postgres+PostGIS so
+# changes to schema.prisma / postgis-setup.sql / tile-functions.sql are
+# caught before merge.
+# =============================================================================
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs of the same PR when a new commit lands
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Lint + typecheck — fast, no services
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint & typecheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Prettier check
+        run: npx prettier --check "**/*.{ts,tsx,md,yml,yaml}"
+
+      - name: ESLint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+  # ---------------------------------------------------------------------------
+  # API tests — full schema lifecycle against PostGIS, then jest
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test (api)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: lint
+
+    services:
+      postgres:
+        image: postgis/postgis:16-3.4
+        env:
+          POSTGRES_DB: farm_erp_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      # Tests connect as superuser since RLS roles are created by the init
+      # script (which doesn't run for `services:` containers). Tests should
+      # explicitly SET ROLE app_user where they want to verify RLS.
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/farm_erp_test
+      DATABASE_ADMIN_URL: postgres://postgres:postgres@localhost:5432/farm_erp_test
+      JWT_ACCESS_SECRET: test-access-secret-not-real-32chars-padding-padding
+      JWT_REFRESH_SECRET: test-refresh-secret-not-real-32chars-padding-padding
+      MINIO_ENDPOINT: localhost
+      MINIO_PORT: '9000'
+      MINIO_ACCESS_KEY: not-used
+      MINIO_SECRET_KEY: not-used
+      MINIO_BUCKET: test
+      REDIS_URL: redis://localhost:6379
+      PUBLIC_BASE_URL: http://localhost:3000
+      CORS_ORIGINS: http://localhost:5173
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Set up roles + extensions
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d farm_erp_test <<'EOF'
+            CREATE EXTENSION IF NOT EXISTS postgis;
+            CREATE EXTENSION IF NOT EXISTS postgis_topology;
+            CREATE EXTENSION IF NOT EXISTS pgcrypto;
+            CREATE EXTENSION IF NOT EXISTS pg_trgm;
+            CREATE EXTENSION IF NOT EXISTS citext;
+            DO $$ BEGIN
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='app_user')  THEN CREATE ROLE app_user;  END IF;
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='app_admin') THEN CREATE ROLE app_admin BYPASSRLS; END IF;
+            END $$;
+            GRANT USAGE ON SCHEMA public TO app_user, app_admin;
+            ALTER DEFAULT PRIVILEGES IN SCHEMA public
+              GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_user, app_admin;
+          EOF
+
+      - name: Prisma migrate
+        run: npx prisma migrate deploy
+
+      - name: Apply postgis-setup.sql
+        run: PGPASSWORD=postgres psql -h localhost -U postgres -d farm_erp_test -v ON_ERROR_STOP=1 -f prisma/postgis-setup.sql
+
+      - name: Apply tile-functions.sql
+        run: PGPASSWORD=postgres psql -h localhost -U postgres -d farm_erp_test -v ON_ERROR_STOP=1 -f prisma/tile-functions.sql
+
+      - name: Seed (dev fixture)
+        run: PGPASSWORD=postgres psql -h localhost -U postgres -d farm_erp_test -v ON_ERROR_STOP=1 -f prisma/seed-ethiopia.sql
+
+      - name: Run tests
+        run: npm test -- --runInBand
+
+      - name: Smoke test — tileserver renders an MVT
+        run: |
+          set -e
+          npm run build
+          node apps/tileserver/dist/server.js &
+          SERVER_PID=$!
+          # Build a quick test JWT for tenant 00000000-...-001
+          TOKEN=$(node -e "
+            const jwt = require('jsonwebtoken');
+            console.log(jwt.sign(
+              { sub: '00000000-0000-4000-8000-000000000010', tid: '00000000-0000-4000-8000-000000000001', roles: ['owner'] },
+              process.env.JWT_ACCESS_SECRET,
+              { expiresIn: '5m' },
+            ));
+          ")
+          # World tile of farms — should be > 0 bytes after seed
+          sleep 2
+          BYTES=$(curl -s -H "Authorization: Bearer $TOKEN" \
+                       "http://localhost:7800/farms/0/0/0.pbf" | wc -c)
+          echo "tile bytes: $BYTES"
+          [ "$BYTES" -gt 0 ] || (echo "tile was empty" && exit 1)
+          kill $SERVER_PID
+
+  # ---------------------------------------------------------------------------
+  # Mobile (RN) — typecheck only on CI; emulator tests need a self-hosted runner
+  # ---------------------------------------------------------------------------
+  mobile-typecheck:
+    name: Typecheck (mobile)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    if: ${{ hashFiles('apps/mobile/**') != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --workspace=apps/mobile
+      - run: npm run typecheck --workspace=apps/mobile
