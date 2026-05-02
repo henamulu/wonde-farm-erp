@@ -1,0 +1,984 @@
+// =============================================================================
+// Farm ERP — Prisma schema
+// =============================================================================
+// PostGIS notes:
+//   - Geometry columns use `Unsupported("geometry(...)")`. Prisma cannot read
+//     or write them via the generated client; use raw queries
+//     (`prisma.$queryRaw`) or expose them as GeoJSON via DB views.
+//   - Generated columns (e.g. area_ha, centroid) and GiST indexes are
+//     created in `postgis-setup.sql`, not here.
+//   - RLS is enabled in `postgis-setup.sql`. Every query must run with
+//     `SET LOCAL app.tenant_id = '<uuid>'` (use a Prisma extension that wraps
+//     each request in a transaction with this setting).
+// =============================================================================
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions", "fullTextSearchPostgres"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [postgis(version: "3.4"), pgcrypto, pg_trgm, citext]
+}
+
+// =============================================================================
+// 1. Tenancy & access control
+// =============================================================================
+
+model Tenant {
+  id           String   @id @default(uuid()) @db.Uuid
+  slug         String   @unique
+  name         String
+  countryCode  String   @map("country_code")  // ISO 3166-1 alpha-2
+  defaultSrid  Int      @default(4326) @map("default_srid")
+  metricSrid   Int      @map("metric_srid")   // local UTM for accurate areas
+  locale       String   @default("en")
+  timezone     String   @default("UTC")
+  status       String   @default("active")    // active | suspended | trial
+  settings     Json     @default("{}")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  users        User[]
+  farms        Farm[]
+
+  @@map("tenant")
+}
+
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  tenantId     String   @map("tenant_id") @db.Uuid
+  email        String
+  passwordHash String   @map("password_hash")
+  fullName     String   @map("full_name")
+  phone        String?
+  locale       String   @default("en")
+  status       String   @default("active")
+  mfaSecret    String?  @map("mfa_secret")
+  lastLoginAt  DateTime? @map("last_login_at")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  tenant       Tenant   @relation(fields: [tenantId], references: [id])
+  roles        UserRole[]
+  employee     Employee?
+
+  @@unique([tenantId, email])
+  @@index([tenantId])
+  @@map("user")
+}
+
+model Role {
+  id        String     @id @default(uuid()) @db.Uuid
+  tenantId  String?    @map("tenant_id") @db.Uuid  // null = system role
+  code      String                                  // owner, agronomist, accountant, ...
+  name      String
+  scopes    String[]                                // permission strings
+  createdAt DateTime   @default(now()) @map("created_at")
+
+  users     UserRole[]
+
+  @@unique([tenantId, code])
+  @@map("role")
+}
+
+model UserRole {
+  userId String @map("user_id") @db.Uuid
+  roleId String @map("role_id") @db.Uuid
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId])
+  @@map("user_role")
+}
+
+// =============================================================================
+// 2. Spatial backbone
+// =============================================================================
+
+model Farm {
+  id            String   @id @default(uuid()) @db.Uuid
+  tenantId      String   @map("tenant_id") @db.Uuid
+  code          String
+  name          String
+  ownerPartnerId String?  @map("owner_partner_id") @db.Uuid
+  geom          Unsupported("geometry(MultiPolygon, 4326)")
+  // centroid + area_ha are stored generated columns (see postgis-setup.sql)
+  centroid      Unsupported("geometry(Point, 4326)")?
+  areaHa        Decimal? @map("area_ha") @db.Decimal(12, 4)
+  altitudeM     Decimal? @map("altitude_m") @db.Decimal(8, 2)
+  agroZone      String?  @map("agro_zone")
+  certifications Json    @default("[]")
+  serverSeq     BigInt   @default(0) @map("server_seq")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+  deletedAt     DateTime? @map("deleted_at")
+
+  tenant         Tenant           @relation(fields: [tenantId], references: [id])
+  parcels        Parcel[]
+  infrastructure Infrastructure[]
+  sensors        Sensor[]
+  warehouses     Warehouse[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@index([serverSeq])
+  @@map("farm")
+}
+
+model Parcel {
+  id            String   @id @default(uuid()) @db.Uuid
+  tenantId      String   @map("tenant_id") @db.Uuid
+  farmId        String   @map("farm_id") @db.Uuid
+  code          String
+  name          String?
+  geom          Unsupported("geometry(Polygon, 4326)")
+  areaHa        Decimal? @map("area_ha") @db.Decimal(12, 4)
+  soilType      String?  @map("soil_type")
+  soilPh        Decimal? @map("soil_ph") @db.Decimal(4, 2)
+  slopePct      Decimal? @map("slope_pct") @db.Decimal(5, 2)
+  irrigated     Boolean  @default(false)
+  cadastralRef  String?  @map("cadastral_ref")
+  serverSeq     BigInt   @default(0) @map("server_seq")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+  deletedAt     DateTime? @map("deleted_at")
+
+  farm          Farm     @relation(fields: [farmId], references: [id])
+  plots         Plot[]
+
+  @@unique([farmId, code])
+  @@index([tenantId])
+  @@index([farmId])
+  @@index([serverSeq])
+  @@map("parcel")
+}
+
+model Plot {
+  id                 String   @id @default(uuid()) @db.Uuid
+  tenantId           String   @map("tenant_id") @db.Uuid
+  parcelId           String   @map("parcel_id") @db.Uuid
+  code               String
+  geom               Unsupported("geometry(Polygon, 4326)")
+  areaHa             Decimal? @map("area_ha") @db.Decimal(12, 4)
+  currentCropPlanId  String?  @map("current_crop_plan_id") @db.Uuid
+  serverSeq          BigInt   @default(0) @map("server_seq")
+  createdAt          DateTime @default(now()) @map("created_at")
+  updatedAt          DateTime @updatedAt @map("updated_at")
+  deletedAt          DateTime? @map("deleted_at")
+
+  parcel             Parcel     @relation(fields: [parcelId], references: [id])
+  cropPlans          CropPlan[]
+
+  @@unique([parcelId, code])
+  @@index([tenantId])
+  @@index([parcelId])
+  @@index([serverSeq])
+  @@map("plot")
+}
+
+model Infrastructure {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  farmId      String   @map("farm_id") @db.Uuid
+  type        String   // warehouse | shed | well | pump | road | fence | gate | other
+  name        String?
+  geom        Unsupported("geometry(Geometry, 4326)")
+  attributes  Json     @default("{}")
+  serverSeq   BigInt   @default(0) @map("server_seq")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  farm        Farm     @relation(fields: [farmId], references: [id])
+
+  @@index([tenantId])
+  @@index([farmId])
+  @@index([type])
+  @@map("infrastructure")
+}
+
+model Sensor {
+  id           String   @id @default(uuid()) @db.Uuid
+  tenantId     String   @map("tenant_id") @db.Uuid
+  farmId       String   @map("farm_id") @db.Uuid
+  type         String   // soil_moisture | temp | rain | weather_station | gps_tracker
+  deviceId     String   @unique @map("device_id")
+  geom         Unsupported("geometry(Point, 4326)")
+  installedAt  DateTime? @map("installed_at")
+  status       String   @default("active")
+  metadata     Json     @default("{}")
+  serverSeq    BigInt   @default(0) @map("server_seq")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  farm         Farm     @relation(fields: [farmId], references: [id])
+
+  @@index([tenantId])
+  @@index([farmId])
+  @@map("sensor")
+}
+
+// =============================================================================
+// 3. Production
+// =============================================================================
+
+model Crop {
+  id         String   @id @default(uuid()) @db.Uuid
+  tenantId   String?  @map("tenant_id") @db.Uuid  // null = global catalog
+  name       String
+  variety    String?
+  category   String?  // cereal | legume | vegetable | fruit | cash_crop
+  cycleDays  Int?     @map("cycle_days")
+  metadata   Json     @default("{}")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  cropPlans  CropPlan[]
+  contracts  Contract[]
+
+  @@unique([tenantId, name, variety])
+  @@map("crop")
+}
+
+model Season {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String   @map("tenant_id") @db.Uuid
+  name      String                                          // "Belg 2026", "Meher 2025/26"
+  startDate DateTime @map("start_date") @db.Date
+  endDate   DateTime @map("end_date") @db.Date
+  status    String   @default("planned")                    // planned | active | closed
+
+  cropPlans CropPlan[]
+  contracts Contract[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@map("season")
+}
+
+model CropPlan {
+  id                  String   @id @default(uuid()) @db.Uuid
+  tenantId            String   @map("tenant_id") @db.Uuid
+  plotId              String   @map("plot_id") @db.Uuid
+  cropId              String   @map("crop_id") @db.Uuid
+  seasonId            String   @map("season_id") @db.Uuid
+  geom                Unsupported("geometry(Polygon, 4326)")
+  areaHa              Decimal? @map("area_ha") @db.Decimal(12, 4)
+  plannedSowingDate   DateTime? @map("planned_sowing_date") @db.Date
+  plannedHarvestDate  DateTime? @map("planned_harvest_date") @db.Date
+  expectedYieldKgHa   Decimal? @map("expected_yield_kg_ha") @db.Decimal(10, 2)
+  status              String   @default("draft")            // draft | active | harvested | cancelled
+  budgetCents         Int?     @map("budget_cents")
+  notes               String?
+  serverSeq           BigInt   @default(0) @map("server_seq")
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+  deletedAt           DateTime? @map("deleted_at")
+
+  plot       Plot           @relation(fields: [plotId], references: [id])
+  crop       Crop           @relation(fields: [cropId], references: [id])
+  season     Season         @relation(fields: [seasonId], references: [id])
+  activities CropActivity[]
+  harvests   Harvest[]
+
+  @@index([tenantId])
+  @@index([plotId])
+  @@index([seasonId])
+  @@index([status])
+  @@index([serverSeq])
+  @@map("crop_plan")
+}
+
+model CropActivity {
+  id           String   @id @default(uuid()) @db.Uuid
+  tenantId     String   @map("tenant_id") @db.Uuid
+  cropPlanId   String   @map("crop_plan_id") @db.Uuid
+  type         String                                       // land_prep | sowing | fertilizing | spraying | weeding | irrigating | scouting | harvesting
+  scheduledAt  DateTime? @map("scheduled_at")
+  startedAt    DateTime? @map("started_at")
+  completedAt  DateTime? @map("completed_at")
+  performedById String?  @map("performed_by_id") @db.Uuid
+  inputsUsed   Json     @default("[]") @map("inputs_used")  // [{ batch_id, qty, uom }]
+  geomTrack    Unsupported("geometry(MultiLineString, 4326)")?
+  geomPoint    Unsupported("geometry(Point, 4326)")?
+  photos       Json     @default("[]")                       // [{ key, taken_at, geom }]
+  notes        String?
+  status       String   @default("scheduled")                // scheduled | in_progress | done | cancelled
+  serverSeq    BigInt   @default(0) @map("server_seq")
+  clientId     String?  @map("client_id")                    // mobile-generated id for sync
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  cropPlan     CropPlan @relation(fields: [cropPlanId], references: [id])
+  performedBy  Employee? @relation(fields: [performedById], references: [id])
+
+  @@index([tenantId])
+  @@index([cropPlanId])
+  @@index([performedById])
+  @@index([status])
+  @@index([serverSeq])
+  @@unique([tenantId, clientId])
+  @@map("crop_activity")
+}
+
+model Harvest {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @map("tenant_id") @db.Uuid
+  cropPlanId      String   @map("crop_plan_id") @db.Uuid
+  harvestedAt     DateTime @map("harvested_at")
+  quantityKg      Decimal  @map("quantity_kg") @db.Decimal(12, 3)
+  moisturePct     Decimal? @map("moisture_pct") @db.Decimal(5, 2)
+  qualityGrade    String?  @map("quality_grade")
+  producedBatchId String?  @map("produced_batch_id") @db.Uuid
+  geom            Unsupported("geometry(Polygon, 4326)")?
+  notes           String?
+  serverSeq       BigInt   @default(0) @map("server_seq")
+  clientId        String?  @map("client_id")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  cropPlan     CropPlan @relation(fields: [cropPlanId], references: [id])
+  producedBatch Batch?  @relation(fields: [producedBatchId], references: [id])
+
+  @@index([tenantId])
+  @@index([cropPlanId])
+  @@index([serverSeq])
+  @@unique([tenantId, clientId])
+  @@map("harvest")
+}
+
+// =============================================================================
+// 4. Inventory
+// =============================================================================
+
+model Sku {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  code        String
+  name        String
+  category    String   // raw_material | seed | fertilizer | pesticide | finished_good | packaging
+  baseUom     String   @map("base_uom")
+  trackBatches Boolean @default(true) @map("track_batches")
+  attributes  Json     @default("{}")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  batches     Batch[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("sku")
+}
+
+model Warehouse {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String   @map("tenant_id") @db.Uuid
+  farmId    String?  @map("farm_id") @db.Uuid
+  code      String
+  name      String
+  geom      Unsupported("geometry(Point, 4326)")?
+  capacity  Json     @default("{}")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  farm      Farm?    @relation(fields: [farmId], references: [id])
+  stocks    Stock[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("warehouse")
+}
+
+model Batch {
+  id           String   @id @default(uuid()) @db.Uuid
+  tenantId     String   @map("tenant_id") @db.Uuid
+  skuId        String   @map("sku_id") @db.Uuid
+  lotNumber    String   @map("lot_number")
+  origin       String                                         // harvest | purchase | production
+  originRefId  String?  @map("origin_ref_id") @db.Uuid
+  producedAt   DateTime? @map("produced_at") @db.Date
+  expiryAt     DateTime? @map("expiry_at") @db.Date
+  attributes   Json     @default("{}")                        // moisture, grade, residue tests...
+  serverSeq    BigInt   @default(0) @map("server_seq")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  sku          Sku      @relation(fields: [skuId], references: [id])
+  stocks       Stock[]
+  harvests     Harvest[]
+
+  @@unique([tenantId, lotNumber])
+  @@index([tenantId])
+  @@index([skuId])
+  @@index([serverSeq])
+  @@map("batch")
+}
+
+model Stock {
+  batchId     String  @map("batch_id") @db.Uuid
+  warehouseId String  @map("warehouse_id") @db.Uuid
+  tenantId    String  @map("tenant_id") @db.Uuid
+  quantity    Decimal @db.Decimal(14, 3)
+  uom         String
+
+  batch       Batch     @relation(fields: [batchId], references: [id])
+  warehouse   Warehouse @relation(fields: [warehouseId], references: [id])
+
+  @@id([batchId, warehouseId])
+  @@index([tenantId])
+  @@index([warehouseId])
+  @@map("stock")
+}
+
+model StockMove {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  batchId     String   @map("batch_id") @db.Uuid
+  fromWhId    String?  @map("from_wh_id") @db.Uuid
+  toWhId      String?  @map("to_wh_id") @db.Uuid
+  qty         Decimal  @db.Decimal(14, 3)
+  uom         String
+  type        String                                          // in | out | transfer | adjust
+  refDoc      Json?    @map("ref_doc")                        // { type, id }
+  postedAt    DateTime @map("posted_at")
+  createdById String?  @map("created_by_id") @db.Uuid
+  serverSeq   BigInt   @default(0) @map("server_seq")
+  clientId    String?  @map("client_id")
+
+  @@index([tenantId])
+  @@index([batchId])
+  @@index([postedAt])
+  @@index([serverSeq])
+  @@unique([tenantId, clientId])
+  @@map("stock_move")
+}
+
+// =============================================================================
+// 5. Sales, Purchases, Partners
+// =============================================================================
+
+model Partner {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String   @map("tenant_id") @db.Uuid
+  type      String                                            // customer | vendor | both | outgrower
+  name      String
+  taxId     String?  @map("tax_id")
+  email     String?
+  phone     String?
+  address   Json     @default("{}")
+  geom      Unsupported("geometry(Point, 4326)")?
+  metadata  Json     @default("{}")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  salesOrders     SalesOrder[]
+  purchaseOrders  PurchaseOrder[]
+  invoices        Invoice[]
+  payments        Payment[]
+  outgrower       Outgrower?
+
+  @@index([tenantId])
+  @@index([type])
+  @@map("partner")
+}
+
+model SalesOrder {
+  id         String    @id @default(uuid()) @db.Uuid
+  tenantId   String    @map("tenant_id") @db.Uuid
+  partnerId  String    @map("partner_id") @db.Uuid
+  number     String
+  status     String    @default("draft")                      // draft | confirmed | delivered | invoiced | cancelled
+  orderedAt  DateTime  @map("ordered_at") @db.Date
+  totalCents Int       @map("total_cents")
+  currency   String    @default("USD")
+  notes      String?
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  partner    Partner          @relation(fields: [partnerId], references: [id])
+  lines      SalesOrderLine[]
+
+  @@unique([tenantId, number])
+  @@index([tenantId])
+  @@map("sales_order")
+}
+
+model SalesOrderLine {
+  id            String   @id @default(uuid()) @db.Uuid
+  salesOrderId  String   @map("sales_order_id") @db.Uuid
+  skuId         String   @map("sku_id") @db.Uuid
+  qty           Decimal  @db.Decimal(14, 3)
+  uom           String
+  unitPriceCents Int     @map("unit_price_cents")
+  cropPlanId    String?  @map("crop_plan_id") @db.Uuid
+
+  salesOrder    SalesOrder @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+
+  @@map("sales_order_line")
+}
+
+model PurchaseOrder {
+  id         String   @id @default(uuid()) @db.Uuid
+  tenantId   String   @map("tenant_id") @db.Uuid
+  partnerId  String   @map("partner_id") @db.Uuid
+  number     String
+  status     String   @default("draft")
+  orderedAt  DateTime @map("ordered_at") @db.Date
+  totalCents Int      @map("total_cents")
+  currency   String   @default("USD")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  partner    Partner             @relation(fields: [partnerId], references: [id])
+  lines      PurchaseOrderLine[]
+
+  @@unique([tenantId, number])
+  @@index([tenantId])
+  @@map("purchase_order")
+}
+
+model PurchaseOrderLine {
+  id              String  @id @default(uuid()) @db.Uuid
+  purchaseOrderId String  @map("purchase_order_id") @db.Uuid
+  skuId           String  @map("sku_id") @db.Uuid
+  qty             Decimal @db.Decimal(14, 3)
+  uom             String
+  unitPriceCents  Int     @map("unit_price_cents")
+
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+
+  @@map("purchase_order_line")
+}
+
+model Invoice {
+  id         String   @id @default(uuid()) @db.Uuid
+  tenantId   String   @map("tenant_id") @db.Uuid
+  kind       String                                           // customer | vendor
+  partnerId  String   @map("partner_id") @db.Uuid
+  number     String
+  status     String   @default("draft")                       // draft | open | paid | partial | overdue | cancelled
+  issuedAt   DateTime @map("issued_at") @db.Date
+  dueAt      DateTime @map("due_at") @db.Date
+  totalCents Int      @map("total_cents")
+  paidCents  Int      @default(0) @map("paid_cents")
+  currency   String   @default("USD")
+  externalRef String? @map("external_ref")                    // e.g. SII / Verifactu id
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  partner    Partner       @relation(fields: [partnerId], references: [id])
+  lines      InvoiceLine[]
+  payments   Payment[]
+
+  @@unique([tenantId, kind, number])
+  @@index([tenantId])
+  @@index([dueAt])
+  @@map("invoice")
+}
+
+model InvoiceLine {
+  id              String  @id @default(uuid()) @db.Uuid
+  invoiceId       String  @map("invoice_id") @db.Uuid
+  description     String
+  qty             Decimal @db.Decimal(14, 3)
+  uom             String?
+  unitPriceCents  Int     @map("unit_price_cents")
+  taxRate         Decimal @default(0) @map("tax_rate") @db.Decimal(5, 4)
+
+  invoice         Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@map("invoice_line")
+}
+
+model Payment {
+  id         String   @id @default(uuid()) @db.Uuid
+  tenantId   String   @map("tenant_id") @db.Uuid
+  partnerId  String   @map("partner_id") @db.Uuid
+  invoiceId  String?  @map("invoice_id") @db.Uuid
+  method     String   // cash | bank_transfer | card | mpesa | telebirr | check
+  amountCents Int     @map("amount_cents")
+  currency   String   @default("USD")
+  postedAt   DateTime @map("posted_at")
+  externalRef String? @map("external_ref")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  partner    Partner  @relation(fields: [partnerId], references: [id])
+  invoice    Invoice? @relation(fields: [invoiceId], references: [id])
+
+  @@index([tenantId])
+  @@map("payment")
+}
+
+// =============================================================================
+// 6. Accounting
+// =============================================================================
+
+model Account {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String   @map("tenant_id") @db.Uuid
+  code      String
+  name      String
+  type      String                                            // asset | liability | equity | income | expense
+  parentId  String?  @map("parent_id") @db.Uuid
+  active    Boolean  @default(true)
+
+  parent    Account?  @relation("AccountHierarchy", fields: [parentId], references: [id])
+  children  Account[] @relation("AccountHierarchy")
+  lines     JournalLine[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("account")
+}
+
+model Journal {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String   @map("tenant_id") @db.Uuid
+  code      String
+  name      String
+  type      String   // sales | purchases | bank | cash | general
+
+  entries   JournalEntry[]
+
+  @@unique([tenantId, code])
+  @@map("journal")
+}
+
+model JournalEntry {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String   @map("tenant_id") @db.Uuid
+  journalId String   @map("journal_id") @db.Uuid
+  date      DateTime @db.Date
+  ref       String?
+  posted    Boolean  @default(false)
+  postedAt  DateTime? @map("posted_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  journal   Journal       @relation(fields: [journalId], references: [id])
+  lines     JournalLine[]
+
+  @@index([tenantId])
+  @@index([date])
+  @@map("journal_entry")
+}
+
+model JournalLine {
+  id           String  @id @default(uuid()) @db.Uuid
+  entryId      String  @map("entry_id") @db.Uuid
+  accountId    String  @map("account_id") @db.Uuid
+  partnerId    String? @map("partner_id") @db.Uuid
+  debitCents   Int     @default(0) @map("debit_cents")
+  creditCents  Int     @default(0) @map("credit_cents")
+  description  String?
+  // Analytic dimensions — these are the GIS-aware cost-center tags
+  cropPlanId   String? @map("crop_plan_id") @db.Uuid
+  parcelId     String? @map("parcel_id") @db.Uuid
+  seasonId     String? @map("season_id") @db.Uuid
+  costCenter   String? @map("cost_center")
+
+  entry        JournalEntry @relation(fields: [entryId], references: [id], onDelete: Cascade)
+  account      Account      @relation(fields: [accountId], references: [id])
+
+  @@index([accountId])
+  @@index([cropPlanId])
+  @@index([parcelId])
+  @@index([seasonId])
+  @@map("journal_line")
+}
+
+model FiscalPeriod {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String   @map("tenant_id") @db.Uuid
+  name      String
+  startDate DateTime @map("start_date") @db.Date
+  endDate   DateTime @map("end_date") @db.Date
+  closed    Boolean  @default(false)
+  closedAt  DateTime? @map("closed_at")
+
+  @@unique([tenantId, name])
+  @@map("fiscal_period")
+}
+
+// =============================================================================
+// 7. Contract farming
+// =============================================================================
+
+model Outgrower {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @map("tenant_id") @db.Uuid
+  partnerId       String   @unique @map("partner_id") @db.Uuid
+  farmGeom        Unsupported("geometry(MultiPolygon, 4326)")?
+  kycStatus       String   @default("pending") @map("kyc_status")
+  kycDocuments    Json     @default("[]") @map("kyc_documents")
+  enrolledAt      DateTime @default(now()) @map("enrolled_at")
+
+  partner         Partner    @relation(fields: [partnerId], references: [id])
+  contracts       Contract[]
+
+  @@index([tenantId])
+  @@map("outgrower")
+}
+
+model Contract {
+  id                  String   @id @default(uuid()) @db.Uuid
+  tenantId            String   @map("tenant_id") @db.Uuid
+  outgrowerId         String   @map("outgrower_id") @db.Uuid
+  seasonId            String   @map("season_id") @db.Uuid
+  cropId              String   @map("crop_id") @db.Uuid
+  number              String
+  geom                Unsupported("geometry(Polygon, 4326)")
+  areaHa              Decimal? @map("area_ha") @db.Decimal(12, 4)
+  expectedYieldKg     Decimal? @map("expected_yield_kg") @db.Decimal(14, 2)
+  priceModel          Json     @map("price_model")             // { type: 'fixed' | 'market_plus_bonus' | 'floor_ceiling', ... }
+  advancesTotalCents  Int      @default(0) @map("advances_total_cents")
+  status              String   @default("draft")               // draft | signed | active | settled | cancelled
+  signedAt            DateTime? @map("signed_at")
+  serverSeq           BigInt   @default(0) @map("server_seq")
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  outgrower    Outgrower            @relation(fields: [outgrowerId], references: [id])
+  season       Season               @relation(fields: [seasonId], references: [id])
+  crop         Crop                 @relation(fields: [cropId], references: [id])
+  advances     ContractAdvance[]
+  deliveries   ContractDelivery[]
+
+  @@unique([tenantId, number])
+  @@index([tenantId])
+  @@index([serverSeq])
+  @@map("contract")
+}
+
+model ContractAdvance {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  contractId  String   @map("contract_id") @db.Uuid
+  type        String   // seed | fertilizer | cash | other
+  description String?
+  amountCents Int      @map("amount_cents")
+  deliveredAt DateTime @map("delivered_at")
+  batchId     String?  @map("batch_id") @db.Uuid              // if material advance
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  contract    Contract @relation(fields: [contractId], references: [id])
+
+  @@index([contractId])
+  @@map("contract_advance")
+}
+
+model ContractDelivery {
+  id           String   @id @default(uuid()) @db.Uuid
+  tenantId     String   @map("tenant_id") @db.Uuid
+  contractId   String   @map("contract_id") @db.Uuid
+  batchId      String?  @map("batch_id") @db.Uuid
+  qtyKg        Decimal  @map("qty_kg") @db.Decimal(14, 3)
+  qcGrade      String?  @map("qc_grade")
+  pricePerKgCents Int   @map("price_per_kg_cents")
+  paidCents    Int      @default(0) @map("paid_cents")
+  deliveredAt  DateTime @map("delivered_at")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  contract     Contract @relation(fields: [contractId], references: [id])
+
+  @@index([contractId])
+  @@map("contract_delivery")
+}
+
+// =============================================================================
+// 8. Quality Control
+// =============================================================================
+
+model QcProtocol {
+  id         String   @id @default(uuid()) @db.Uuid
+  tenantId   String   @map("tenant_id") @db.Uuid
+  code       String
+  name       String
+  appliesTo  String   @map("applies_to")                       // batch | harvest | plot | sample
+  parameters Json                                              // [{ key, label, type, min, max, unit }]
+  active     Boolean  @default(true)
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  tests      QcTest[]
+
+  @@unique([tenantId, code])
+  @@map("qc_protocol")
+}
+
+model QcTest {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  protocolId  String   @map("protocol_id") @db.Uuid
+  targetType  String   @map("target_type")                    // batch | harvest | plot
+  targetId    String   @map("target_id") @db.Uuid
+  results     Json                                            // { paramKey: value, ... }
+  pass        Boolean
+  testedAt    DateTime @map("tested_at")
+  testedById  String?  @map("tested_by_id") @db.Uuid
+  notes       String?
+  serverSeq   BigInt   @default(0) @map("server_seq")
+  clientId    String?  @map("client_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  protocol    QcProtocol @relation(fields: [protocolId], references: [id])
+
+  @@index([tenantId])
+  @@index([targetType, targetId])
+  @@index([serverSeq])
+  @@unique([tenantId, clientId])
+  @@map("qc_test")
+}
+
+// =============================================================================
+// 9. HR
+// =============================================================================
+
+model Employee {
+  id           String   @id @default(uuid()) @db.Uuid
+  tenantId     String   @map("tenant_id") @db.Uuid
+  userId       String?  @unique @map("user_id") @db.Uuid
+  partnerId    String?  @map("partner_id") @db.Uuid
+  code         String
+  fullName     String   @map("full_name")
+  role         String                                          // agronomist | field_worker | warehouse | accountant | manager
+  hiredAt      DateTime? @map("hired_at") @db.Date
+  terminatedAt DateTime? @map("terminated_at") @db.Date
+  salaryModel  Json     @default("{}") @map("salary_model")
+  status       String   @default("active")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  user         User?         @relation(fields: [userId], references: [id])
+  attendances  Attendance[]
+  activities   CropActivity[]
+  payslips     Payslip[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("employee")
+}
+
+model Attendance {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @map("tenant_id") @db.Uuid
+  employeeId      String   @map("employee_id") @db.Uuid
+  inAt            DateTime @map("in_at")
+  outAt           DateTime? @map("out_at")
+  inGeom          Unsupported("geometry(Point, 4326)")?
+  outGeom         Unsupported("geometry(Point, 4326)")?
+  inGeofenceOk    Boolean? @map("in_geofence_ok")
+  outGeofenceOk   Boolean? @map("out_geofence_ok")
+  hoursDecimal    Decimal? @map("hours_decimal") @db.Decimal(5, 2)
+  serverSeq       BigInt   @default(0) @map("server_seq")
+  clientId        String?  @map("client_id")
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  employee        Employee @relation(fields: [employeeId], references: [id])
+
+  @@index([tenantId])
+  @@index([employeeId])
+  @@index([serverSeq])
+  @@unique([tenantId, clientId])
+  @@map("attendance")
+}
+
+model PayrollPeriod {
+  id        String    @id @default(uuid()) @db.Uuid
+  tenantId  String    @map("tenant_id") @db.Uuid
+  name      String
+  startDate DateTime  @map("start_date") @db.Date
+  endDate   DateTime  @map("end_date") @db.Date
+  closed    Boolean   @default(false)
+
+  payslips  Payslip[]
+
+  @@unique([tenantId, name])
+  @@map("payroll_period")
+}
+
+model Payslip {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @map("tenant_id") @db.Uuid
+  periodId        String   @map("period_id") @db.Uuid
+  employeeId      String   @map("employee_id") @db.Uuid
+  grossCents      Int      @map("gross_cents")
+  deductions      Json     @default("[]")
+  netCents        Int      @map("net_cents")
+  paidAt          DateTime? @map("paid_at")
+  generatedAt     DateTime @default(now()) @map("generated_at")
+
+  period          PayrollPeriod @relation(fields: [periodId], references: [id])
+  employee        Employee      @relation(fields: [employeeId], references: [id])
+
+  @@unique([periodId, employeeId])
+  @@map("payslip")
+}
+
+// =============================================================================
+// 10. Compliance & audit
+// =============================================================================
+
+model AuditLog {
+  id          BigInt   @id @default(autoincrement())
+  tenantId    String   @map("tenant_id") @db.Uuid
+  userId      String?  @map("user_id") @db.Uuid
+  action      String                                          // create | update | delete | login | export | submit
+  entity      String
+  entityId    String?  @map("entity_id")
+  before      Json?
+  after       Json?
+  ip          String?
+  userAgent   String?  @map("user_agent")
+  occurredAt  DateTime @default(now()) @map("occurred_at")
+
+  @@index([tenantId, occurredAt])
+  @@index([entity, entityId])
+  @@map("audit_log")
+}
+
+model ComplianceReport {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  kind        String   // sii | verifactu | sigpac_declaration | annual_audit | custom
+  periodStart DateTime @map("period_start") @db.Date
+  periodEnd   DateTime @map("period_end") @db.Date
+  payload     Json
+  status      String   @default("draft")                      // draft | submitted | accepted | rejected
+  submittedAt DateTime? @map("submitted_at")
+  externalRef String?  @map("external_ref")
+  fileKey     String?  @map("file_key")                       // MinIO key for generated PDF/XML
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@index([tenantId])
+  @@index([kind])
+  @@map("compliance_report")
+}
+
+// =============================================================================
+// 11. Sync support
+// =============================================================================
+
+model SyncCheckpoint {
+  id            String   @id @default(uuid()) @db.Uuid
+  tenantId      String   @map("tenant_id") @db.Uuid
+  userId        String   @map("user_id") @db.Uuid
+  deviceId      String   @map("device_id")
+  lastServerSeq BigInt   @default(0) @map("last_server_seq")
+  lastPulledAt  DateTime? @map("last_pulled_at")
+  lastPushedAt  DateTime? @map("last_pushed_at")
+
+  @@unique([userId, deviceId])
+  @@index([tenantId])
+  @@map("sync_checkpoint")
+}
+
+model SyncConflict {
+  id           String   @id @default(uuid()) @db.Uuid
+  tenantId     String   @map("tenant_id") @db.Uuid
+  userId       String   @map("user_id") @db.Uuid
+  deviceId     String   @map("device_id")
+  entity       String
+  entityId     String   @map("entity_id")
+  clientPayload Json    @map("client_payload")
+  serverPayload Json    @map("server_payload")
+  resolution   String?                                         // server_wins | client_wins | merged | manual
+  resolvedAt   DateTime? @map("resolved_at")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  @@index([tenantId])
+  @@map("sync_conflict")
+}
