@@ -170,3 +170,4 @@ jobs:
           echo "::warning::Deploy failed. To roll back, SSH to the box and run:"
           echo "  cd /opt/wonde-farm-erp && export TAG=<previous-sha> && docker compose up -d"
 
+
