@@ -1,23 +1,23 @@
-# =============================================================================
+﻿# =============================================================================
 # .github/workflows/deploy.yml
 # =============================================================================
-# On push to main: build api, tileserver, worker images â†’ push to GHCR
-# (ghcr.io/<owner>/<repo>/<service>:<sha>+latest) â†’ SSH to the Hetzner box,
+# On push to main: build api, tileserver, worker images Ã¢â€ â€™ push to GHCR
+# (ghcr.io/<owner>/<repo>/<service>:<sha>+latest) Ã¢â€ â€™ SSH to the Hetzner box,
 # pull the new images, run migrations, restart services.
 #
 # Required GitHub Secrets:
-#   HETZNER_HOST       â€” IP or DNS of the production box
-#   HETZNER_USER       â€” SSH user (typically `deploy`, NOT root)
-#   HETZNER_SSH_KEY    â€” private key with access to that user
-#   HETZNER_SSH_PORT   â€” (optional) defaults to 22
+#   HETZNER_HOST       Ã¢â‚¬â€ IP or DNS of the production box
+#   HETZNER_USER       Ã¢â‚¬â€ SSH user (typically `deploy`, NOT root)
+#   HETZNER_SSH_KEY    Ã¢â‚¬â€ private key with access to that user
+#   HETZNER_SSH_PORT   Ã¢â‚¬â€ (optional) defaults to 22
 #
 # Required Hetzner-side preparation, run ONCE on the box:
 #   1.  useradd -m -s /bin/bash deploy && usermod -aG docker deploy
 #   2.  su - deploy
-#   3.  mkdir -p /opt/farmerp && cd /opt/farmerp
-#   4.  Clone the repo + copy .env.example â†’ .env (fill secrets)
+#   3.  mkdir -p /opt/farmerp && cd /opt/wonde-farm-erp
+#   4.  Clone the repo + copy .env.example Ã¢â€ â€™ .env (fill secrets)
 #   5.  echo $GHCR_TOKEN | docker login ghcr.io -u <github-user> --password-stdin
-#       (token = a GitHub PAT with read:packages scope â€” stored on the box,
+#       (token = a GitHub PAT with read:packages scope Ã¢â‚¬â€ stored on the box,
 #        not in this workflow, so the box can pull private images)
 #   6.  docker compose --profile migrate run --rm api-migrate
 #   7.  docker compose up -d
@@ -127,11 +127,11 @@ jobs:
           script_stop: true              # halt on first non-zero exit
           script: |
             set -euo pipefail
-            cd /opt/farmerp
+            cd /opt/wonde-farm-erp
 
             export TAG="${{ steps.meta.outputs.tag }}"
 
-            echo "â†’ pulling ${TAG}"
+            echo "Ã¢â€ â€™ pulling ${TAG}"
             # docker-compose.yml on the box should reference these images
             # via env, e.g.  image: ${API_IMAGE}:${TAG:-latest}
             export API_IMAGE=ghcr.io/${{ github.repository }}/api
@@ -139,15 +139,15 @@ jobs:
             export WORKER_IMAGE=ghcr.io/${{ github.repository }}/worker
             docker compose pull api
 
-            echo "â†’ running migrations"
+            echo "Ã¢â€ â€™ running migrations"
             docker compose --profile migrate run --rm api-migrate
 
-            echo "â†’ rolling api + tileserver + worker"
+            echo "Ã¢â€ â€™ rolling api + tileserver + worker"
             docker compose up -d api
-            # Caddy isn't restarted unless its config changed â€” `docker compose
+            # Caddy isn't restarted unless its config changed Ã¢â‚¬â€ `docker compose
             # up -d` with no diff is a no-op.
 
-            echo "â†’ pruning old images (keep last 3 per service)"
+            echo "Ã¢â€ â€™ pruning old images (keep last 3 per service)"
             docker image prune -f
             for svc in api; do
               docker images "ghcr.io/${{ github.repository }}/${svc}" \
@@ -155,17 +155,18 @@ jobs:
                 awk '{print $1}' | xargs -r docker rmi -f || true
             done
 
-            echo "â†’ verifying health"
+            echo "Ã¢â€ â€™ verifying health"
             for i in 1 2 3 4 5 6; do
               if curl -fsS http://localhost:3000/health > /dev/null; then
-                echo "âœ“ api healthy"; break
+                echo "Ã¢Å“â€œ api healthy"; break
               fi
               echo "waiting for api... ($i/6)"; sleep 5
-              if [ $i -eq 6 ]; then echo "âœ— api failed health check"; exit 1; fi
+              if [ $i -eq 6 ]; then echo "Ã¢Å“â€” api failed health check"; exit 1; fi
             done
 
       - name: Notify rollback hint on failure
         if: failure()
         run: |
           echo "::warning::Deploy failed. To roll back, SSH to the box and run:"
-          echo "  cd /opt/farmerp && export TAG=<previous-sha> && docker compose up -d"
+          echo "  cd /opt/wonde-farm-erp && export TAG=<previous-sha> && docker compose up -d"
+
