@@ -11,6 +11,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@farm-erp/sync": "*",
     "@fastify/jwt": "^8.0.0",
     "@nestjs/common": "^10.4.0",
     "@nestjs/config": "^3.2.0",
