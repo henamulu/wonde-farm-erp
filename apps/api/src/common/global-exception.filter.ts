@@ -10,7 +10,10 @@ import {
   ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus, Logger,
 } from '@nestjs/common';
 import { Request, Response } from 'express';
-import { Prisma } from '@prisma/client';
+import {
+  PrismaClientKnownRequestError,
+  PrismaClientValidationError,
+} from '@prisma/client/runtime/library';
 
 interface ErrorResponse {
   error: {
@@ -34,16 +37,15 @@ export class GlobalExceptionFilter implements ExceptionFilter {
 
     const { status, code, message, details } = this.normalize(exception);
 
-    // Log 5xx / unexpected; warn for unauthorised; debug for others
     if (status >= 500) {
       this.logger.error(
-        `${req.method} ${req.url} → ${status} ${code}: ${message}`,
+        `${req.method} ${req.url} -> ${status} ${code}: ${message}`,
         exception instanceof Error ? exception.stack : undefined,
       );
     } else if (status === HttpStatus.UNAUTHORIZED || status === HttpStatus.FORBIDDEN) {
-      this.logger.warn(`${req.method} ${req.url} → ${status} ${code}`);
+      this.logger.warn(`${req.method} ${req.url} -> ${status} ${code}`);
     } else {
-      this.logger.debug?.(`${req.method} ${req.url} → ${status} ${code}: ${message}`);
+      this.logger.debug?.(`${req.method} ${req.url} -> ${status} ${code}: ${message}`);
     }
 
     const body: ErrorResponse = {
@@ -63,7 +65,6 @@ export class GlobalExceptionFilter implements ExceptionFilter {
     if (e instanceof HttpException) {
       const status = e.getStatus();
       const r = e.getResponse() as any;
-      // Nest validation pipe returns { message: string[] | string, error: string }
       if (typeof r === 'object' && r) {
         return {
           status,
@@ -75,11 +76,11 @@ export class GlobalExceptionFilter implements ExceptionFilter {
       return { status, code: this.codeFromStatus(status), message: String(r) };
     }
 
-    // ---- Prisma known errors ----
-    if (e instanceof Prisma.PrismaClientKnownRequestError) {
+    // ---- Prisma known errors (Prisma 5: imported from runtime/library) ----
+    if (e instanceof PrismaClientKnownRequestError) {
       return this.fromPrisma(e);
     }
-    if (e instanceof Prisma.PrismaClientValidationError) {
+    if (e instanceof PrismaClientValidationError) {
       return { status: 400, code: 'invalid_input', message: 'invalid request body' };
     }
 
@@ -92,7 +93,7 @@ export class GlobalExceptionFilter implements ExceptionFilter {
     return { status: 500, code: 'internal_error', message: 'unknown error' };
   }
 
-  private fromPrisma(e: Prisma.PrismaClientKnownRequestError) {
+  private fromPrisma(e: PrismaClientKnownRequestError) {
     switch (e.code) {
       case 'P2002': // unique constraint
         return {

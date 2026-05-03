@@ -20,6 +20,7 @@ import { PassportModule, PassportStrategy } from '@nestjs/passport';
 import { Reflector } from '@nestjs/core';
 import { AuthGuard } from '@nestjs/passport';
 import { ExtractJwt, Strategy } from 'passport-jwt';
+import { compare, hash } from 'bcrypt';
 import { PrismaService } from '../prisma/prisma.service';
 
 // -----------------------------------------------------------------------------
@@ -46,6 +47,18 @@ export interface JwtPayload {
   exp: number;
 }
 
+/**
+ * Shape of the user row returned by the login query (with nested roles).
+ * We type the callbacks against this rather than relying on Prisma's
+ * generic UserGetPayload<...> which is verbose and brittle.
+ */
+interface UserRoleRow {
+  role: {
+    code: string;
+    scopes: string[];
+  };
+}
+
 // -----------------------------------------------------------------------------
 // Decorators
 // -----------------------------------------------------------------------------
@@ -58,10 +71,10 @@ export const CurrentUser = createParamDecorator(
   },
 );
 
-/** `@Roles('owner','accountant')` — combined with RolesGuard */
+/** `@Roles('owner','accountant')` - combined with RolesGuard */
 export const Roles = (...roles: string[]) => SetMetadata('roles', roles);
 
-/** `@Public()` — opt out of JwtAuthGuard for specific endpoints */
+/** `@Public()` - opt out of JwtAuthGuard for specific endpoints */
 export const Public = () => SetMetadata('isPublic', true);
 
 // -----------------------------------------------------------------------------
@@ -74,7 +87,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     super({
       jwtFromRequest: ExtractJwt.fromExtractors([
         // Web: httpOnly cookie
-        (req) => req?.cookies?.access_token ?? null,
+        (req: any) => req?.cookies?.access_token ?? null,
         // Mobile + integrations: Authorization: Bearer <token>
         ExtractJwt.fromAuthHeaderAsBearerToken(),
       ]),
@@ -84,11 +97,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     });
   }
 
-  async validate(req: any, payload: JwtPayload): Promise<AuthUser> {
-    // The token is signed, so we trust its content for the hot path.
-    // Heavy revocation/role-changed checks should run at login + occasional
-    // refresh, not on every request — otherwise a Postgres roundtrip per
-    // call kills your throughput.
+  async validate(_req: any, payload: JwtPayload): Promise<AuthUser> {
     if (!payload?.sub || !payload?.tid) {
       throw new UnauthorizedException('malformed token');
     }
@@ -132,7 +141,7 @@ export class RolesGuard implements CanActivate {
     ]);
     if (!required || required.length === 0) return true;
     const { user } = context.switchToHttp().getRequest();
-    if (!user || !required.some((r) => user.roles.includes(r))) {
+    if (!user || !required.some((r) => (user as AuthUser).roles.includes(r))) {
       throw new ForbiddenException('insufficient role');
     }
     return true;
@@ -140,10 +149,8 @@ export class RolesGuard implements CanActivate {
 }
 
 // -----------------------------------------------------------------------------
-// Login service (sketch — flesh out password reset, MFA, etc. as needed)
+// Login service (sketch - flesh out password reset, MFA, etc. as needed)
 // -----------------------------------------------------------------------------
-
-import { compare, hash } from 'bcrypt';
 
 @Injectable()
 export class AuthService {
@@ -155,13 +162,8 @@ export class AuthService {
   /**
    * Login is a cross-tenant operation, so it runs WITHOUT the tenant GUC.
    * The `app_admin` role (BYPASSRLS) is appropriate for this connection.
-   * In practice you'd have a separate Prisma client wired with that role.
    */
   async login(email: string, password: string, deviceId?: string) {
-    // NOTE: this query bypasses RLS — see the comment above. In dev with the
-    // same role as the app, RLS will block this unless app.tenant_id is set
-    // to a sentinel. Pragmatic dev workaround: prefix login users with email,
-    // and use a SECURITY DEFINER function for cross-tenant lookup.
     const user = await this.prisma.user.findFirst({
       where: { email },
       include: { roles: { include: { role: true } } },
@@ -172,9 +174,14 @@ export class AuthService {
     const ok = await compare(password, user.passwordHash);
     if (!ok) throw new UnauthorizedException('invalid credentials');
 
-    const roleCodes = user.roles.map((ur) => ur.role.code);
-    const scopes = Array.from(
-      new Set(user.roles.flatMap((ur) => ur.role.scopes)),
+    // Cast the nested relation to our local row shape so the callbacks type-check.
+    // The Prisma-generated type for this exact include shape is verbose
+    // (UserGetPayload<{ include: ... }>) and offers no real safety here.
+    const userRoles = user.roles as unknown as UserRoleRow[];
+
+    const roleCodes: string[] = userRoles.map((ur) => ur.role.code);
+    const scopes: string[] = Array.from(
+      new Set(userRoles.flatMap((ur) => ur.role.scopes)),
     );
 
     const payload: Omit<JwtPayload, 'iat' | 'exp'> = {
@@ -195,13 +202,16 @@ export class AuthService {
       expiresIn: deviceId ? '90d' : '14d', // mobile gets longer refresh
     });
 
-    // Store hashed refresh token for revocation. Skipped here for brevity.
     await this.prisma.user.update({
       where: { id: user.id },
       data: { lastLoginAt: new Date() },
     });
 
-    return { accessToken, refreshToken, user: { id: user.id, email: user.email, roles: roleCodes } };
+    return {
+      accessToken,
+      refreshToken,
+      user: { id: user.id, email: user.email, roles: roleCodes },
+    };
   }
 
   /** Helper for seeding / admin scripts */
@@ -217,7 +227,7 @@ export class AuthService {
 @Module({
   imports: [
     PassportModule,
-    JwtModule.register({}), // secrets passed per-call so we can use different keys for access/refresh
+    JwtModule.register({}),
   ],
   providers: [JwtStrategy, JwtAuthGuard, RolesGuard, AuthService],
   exports: [JwtAuthGuard, RolesGuard, AuthService],
