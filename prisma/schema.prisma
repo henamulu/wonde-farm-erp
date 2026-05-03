@@ -1,5 +1,5 @@
 // =============================================================================
-// Farm ERP — Prisma schema
+// Farm ERP â€” Prisma schema
 // =============================================================================
 // PostGIS notes:
 //   - Geometry columns use `Unsupported("geometry(...)")`. Prisma cannot read
@@ -14,7 +14,7 @@
 
 generator client {
   provider        = "prisma-client-js"
-  previewFeatures = ["postgresqlExtensions", "fullTextSearchPostgres"]
+  previewFeatures = ["postgresqlExtensions", "fullTextSearch", "fullTextIndex"]
 }
 
 datasource db {
@@ -666,7 +666,7 @@ model JournalLine {
   debitCents   Int     @default(0) @map("debit_cents")
   creditCents  Int     @default(0) @map("credit_cents")
   description  String?
-  // Analytic dimensions — these are the GIS-aware cost-center tags
+  // Analytic dimensions â€” these are the GIS-aware cost-center tags
   cropPlanId   String? @map("crop_plan_id") @db.Uuid
   parcelId     String? @map("parcel_id") @db.Uuid
   seasonId     String? @map("season_id") @db.Uuid
