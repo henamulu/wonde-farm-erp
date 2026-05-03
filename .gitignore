@@ -50,3 +50,6 @@ apps/mobile/android/.gradle/
 # OS / misc
 .cache/
 tmp/
+
+.env
+
