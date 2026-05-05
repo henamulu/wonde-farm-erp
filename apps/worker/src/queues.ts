@@ -423,4 +423,4 @@ export async function registerSchedules(connection: IORedis): Promise<void> {
   // for the lifetime of the process so the API can also enqueue ad-hoc.
 }
 
-const log = new Logger('Schedules');
+

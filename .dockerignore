@@ -1,0 +1,53 @@
+# Don't ship local node_modules to the Docker daemon — the Dockerfile
+# installs its own. Local node_modules contains npm-workspace symlinks
+# that don't tar cleanly on Windows anyway.
+node_modules/
+**/node_modules/
+
+# Build outputs from previous local runs
+dist/
+build/
+**/dist/
+**/build/
+*.tsbuildinfo
+
+# Logs and tmp
+*.log
+.npm/
+.cache/
+tmp/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.swp
+
+# Git
+.git/
+.gitignore
+.github/
+
+# Test artifacts
+coverage/
+.nyc_output/
+e2e/.artifacts/
+playwright-report/
+test-results/
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Mobile (large, irrelevant to API/tileserver/worker builds)
+apps/mobile/.expo/
+apps/mobile/ios/
+apps/mobile/android/
+
+# Docker
+docker-compose.yml
+docker-compose.*.yml
+*.tar.gz
+BOOTSTRAP.sh
