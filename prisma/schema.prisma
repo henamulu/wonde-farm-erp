@@ -20,7 +20,6 @@ generator client {
 datasource db {
   provider   = "postgresql"
   url        = env("DATABASE_URL")
-  extensions = [postgis(version: "3.4"), pgcrypto, pg_trgm, citext]
 }
 
 // =============================================================================
@@ -302,8 +301,8 @@ model CropActivity {
   completedAt  DateTime? @map("completed_at")
   performedById String?  @map("performed_by_id") @db.Uuid
   inputsUsed   Json     @default("[]") @map("inputs_used")  // [{ batch_id, qty, uom }]
-  geomTrack    Unsupported("geometry(MultiLineString, 4326)")?
-  geomPoint    Unsupported("geometry(Point, 4326)")?
+  geomTrack Unsupported("geometry(MultiLineString, 4326)")? @map("geom_track")
+  geomPoint Unsupported("geometry(Point, 4326)")?           @map("geom_point")
   photos       Json     @default("[]")                       // [{ key, taken_at, geom }]
   notes        String?
   status       String   @default("scheduled")                // scheduled | in_progress | done | cancelled
@@ -703,7 +702,7 @@ model Outgrower {
   id              String   @id @default(uuid()) @db.Uuid
   tenantId        String   @map("tenant_id") @db.Uuid
   partnerId       String   @unique @map("partner_id") @db.Uuid
-  farmGeom        Unsupported("geometry(MultiPolygon, 4326)")?
+  farmGeom        Unsupported("geometry(MultiPolygon, 4326)")? @map("farm_geom")
   kycStatus       String   @default("pending") @map("kyc_status")
   kycDocuments    Json     @default("[]") @map("kyc_documents")
   enrolledAt      DateTime @default(now()) @map("enrolled_at")
@@ -858,8 +857,8 @@ model Attendance {
   employeeId      String   @map("employee_id") @db.Uuid
   inAt            DateTime @map("in_at")
   outAt           DateTime? @map("out_at")
-  inGeom          Unsupported("geometry(Point, 4326)")?
-  outGeom         Unsupported("geometry(Point, 4326)")?
+  inGeom          Unsupported("geometry(Point, 4326)")? @map("in_geom")
+  outGeom         Unsupported("geometry(Point, 4326)")? @map("out_geom")
   inGeofenceOk    Boolean? @map("in_geofence_ok")
   outGeofenceOk   Boolean? @map("out_geofence_ok")
   hoursDecimal    Decimal? @map("hours_decimal") @db.Decimal(5, 2)

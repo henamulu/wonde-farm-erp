@@ -2,7 +2,7 @@
 // apps/api/src/prisma/prisma.service.ts
 // =============================================================================
 
-import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { Global, Injectable, Logger, Module, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { PrismaClient } from '@prisma/client';
 
 /** The transactional client surface (no $connect / $transaction / etc). */
@@ -70,3 +70,9 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
     return this;
   }
 }
+@Global()
+@Module({
+  providers: [PrismaService],
+  exports: [PrismaService],
+})
+export class PrismaModule {}

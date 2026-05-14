@@ -201,6 +201,8 @@ services:
     image: farmerp/api:latest
     container_name: farmerp-api
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:3030:3000"
     environment:
       NODE_ENV: production
       PORT: "3000"
@@ -279,10 +281,13 @@ services:
   # BullMQ worker — background jobs
   # ---------------------------------------------------------------------------
   worker:
-    image: farmerp/api:latest
+    build:
+      context: .
+      dockerfile: ./apps/worker/Dockerfile
+    image: farmerp/worker:latest
     container_name: farmerp-worker
     restart: unless-stopped
-    command: ["node", "dist/worker.js"]
+    command: ["node", "dist/main.js"]
     environment:
       NODE_ENV: production
       DATABASE_URL: postgres://app_user:${APP_USER_PASSWORD}@postgres:5432/farm_erp?schema=public
@@ -308,8 +313,8 @@ services:
     container_name: farmerp-caddy
     restart: unless-stopped
     ports:
-      - "80:80"
-      - "443:443"
+      - "8081:80"
+      - "8444:443"
     environment:
       DOMAIN: ${DOMAIN:-localhost}
       ACME_EMAIL: ${ACME_EMAIL:-noreply@example.com}

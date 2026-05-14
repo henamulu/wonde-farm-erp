@@ -318,11 +318,11 @@ DECLARE
   tables text[] := ARRAY[
     'farm','parcel','plot','infrastructure','sensor',
     'crop','season','crop_plan','crop_activity','harvest',
-    'sku','warehouse','batch','stock','stock_move',
-    'partner','sales_order','sales_order_line',
-    'purchase_order','purchase_order_line',
-    'invoice','invoice_line','payment',
-    'account','journal','journal_entry','journal_line','fiscal_period',
+    'sku','warehouse','batch','stock_move',
+    'partner','sales_order',
+    'purchase_order',
+    'invoice','payment',
+    'account','journal','journal_entry','fiscal_period',
     'outgrower','contract','contract_advance','contract_delivery',
     'qc_protocol','qc_test',
     'employee','attendance','payroll_period','payslip',
@@ -397,7 +397,7 @@ DECLARE
     'crop_plan','crop_activity','harvest',
     'batch','stock_move',
     'sales_order','purchase_order','invoice','payment',
-    'journal_entry','journal_line',
+    'journal_entry',
     'contract','contract_advance','contract_delivery',
     'qc_test','attendance','payslip','compliance_report'
   ];

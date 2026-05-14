@@ -53,3 +53,4 @@ tmp/
 
 .env
 
+infra/mosquitto/passwd

@@ -13,7 +13,7 @@ import { ValidationPipe } from '@nestjs/common';
 
 import * as Joi from 'joi';
 
-import { PrismaService } from './prisma/prisma.service';
+import { PrismaModule, PrismaService } from './prisma/prisma.service';
 import { AuthModule, JwtAuthGuard } from './auth/auth.module';
 import { SyncModule } from './sync/sync.module';
 import { GeomModule } from './geom/validate-geom.controller';
@@ -85,6 +85,7 @@ class HealthController {
 // -----------------------------------------------------------------------------
 @Module({
   imports: [
+    PrismaModule,
     ConfigModule.forRoot({
       isGlobal: true,
       validationSchema: ENV_SCHEMA,
@@ -111,8 +112,6 @@ class HealthController {
   controllers: [HealthController],
 
   providers: [
-    PrismaService,
-
     // Global guards — order matters: throttle first, then auth.
     { provide: APP_GUARD, useClass: ThrottlerGuard },
     { provide: APP_GUARD, useClass: JwtAuthGuard },
@@ -133,6 +132,6 @@ class HealthController {
     },
   ],
 
-  exports: [PrismaService],
+  
 })
 export class AppModule {}
